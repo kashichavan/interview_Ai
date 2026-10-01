@@ -1,0 +1,562 @@
+import { SpeechClient } from '@google-cloud/speech';
+import { EventEmitter } from 'events';
+import * as path from 'path';
+import * as fs from 'fs';
+import * as os from 'os';
+import { RECOGNITION_LANGUAGES, EnglishVariant } from '../config/languages';
+
+/**
+ * GoogleSTT
+ * 
+ * Manages a bi-directional streaming connection to Google Speech-to-Text.
+ * Mirrors the logic previously in Swift:
+ * - Handles infinite stream limits by restarting periodically (though less critical for short calls).
+ * - Manages authentication via GOOGLE_APPLICATION_CREDENTIALS.
+ * - Parses intermediate and final results.
+ */
+export class GoogleSTT extends EventEmitter {
+    private client: SpeechClient;
+    private stream: any = null; // Stream type is complex in google-cloud libs
+    private isStreaming = false;
+    private isActive = false;
+    private isFatalError = false;
+    // Set once a code-3 rejection has been answered by dropping to the `default`
+    // model. Bounds the downgrade to a SINGLE retry: a second INVALID_ARGUMENT,
+    // or one that arrives while we are already on `default`, is genuinely
+    // permanent and falls through to the fatal path.
+    private modelDowngraded = false;
+    private label = 'default';
+    private writeCount = 0;
+
+    // Diagnostic raw-PCM dump. Opt-in via NATIVELY_STT_DUMP=1. Captures the
+    // EXACT bytes forwarded to Google's gRPC stream (post keepalive-drop), so
+    // we can play the file back and hear what Google actually receives —
+    // settling "is the audio garbled or is Google misconfigured?" empirically
+    // rather than by inference. One raw file per channel; convert with:
+    //   ffmpeg -f s16le -ar <rate> -ac 1 -i google_stt_<label>.raw out.wav
+    private dumpStream: fs.WriteStream | null = null;
+    private dumpBytes = 0;
+
+    // gRPC permanent failure codes — retrying these is pointless.
+    //   3  = INVALID_ARGUMENT (config the server will never accept)
+    //   7  = PERMISSION_DENIED (API not enabled / wrong project / no IAM)
+    //   16 = UNAUTHENTICATED (bad/expired credentials)
+    private static readonly PERMANENT_GRPC_CODES = new Set([3, 7, 16]);
+
+    // Google STT v1 does not accept the common `zh-*` BCP-47 tags — its
+    // supported-languages table lists Mandarin only as `cmn-Hans-CN` (and
+    // Traditional as `cmn-Hant-TW`). The shared RECOGNITION_LANGUAGES map
+    // keeps `zh-CN` because other providers (Deepgram, Soniox) expect it,
+    // so the translation must stay Google-local.
+    private static readonly V1_LANGUAGE_CODE_OVERRIDES: Record<string, string> = {
+        'zh-CN': 'cmn-Hans-CN',
+        'zh-TW': 'cmn-Hant-TW',
+    };
+
+    // Languages the `latest_long` model does not cover in STT v1 (Mandarin
+    // supports only `default`/`command_and_search`). Requesting latest_long
+    // for these returns INVALID_ARGUMENT (gRPC code 3), which
+    // PERMANENT_GRPC_CODES above then escalates to a session-wide STT
+    // shutdown — the "Chinese never transcribes" bug.
+    private static readonly LANGUAGES_WITHOUT_LATEST_LONG = new Set([
+        'cmn-Hans-CN',
+        'cmn-Hant-TW',
+    ]);
+
+    // Config
+    private encoding = 'LINEAR16' as const;
+    private sampleRateHertz = 16000;
+    private audioChannelCount = 1; // Default to Mono
+    private languageCode = 'en-US';
+    private alternativeLanguageCodes: string[] = ['en-IN', 'en-GB']; // Default fallbacks
+
+    constructor(label?: string) {
+        super();
+        if (label) this.label = label;
+        // ... (credentials setup) ...
+
+        // Note: In production, credentials are set by main.ts via process.env.GOOGLE_APPLICATION_CREDENTIALS
+        // or passed explicitly to setCredentials(). We do not load .env files here to avoid ASAR path issues.
+        const credentialsPath = process.env.GOOGLE_APPLICATION_CREDENTIALS;
+        if (!credentialsPath) {
+            console.error(`[GoogleSTT/${this.label}] Missing GOOGLE_APPLICATION_CREDENTIALS in environment. Checked CWD:`, process.cwd());
+        } else {
+            console.log(`[GoogleSTT/${this.label}] Using credentials from: ${credentialsPath}`);
+        }
+
+        this.client = new SpeechClient({
+            keyFilename: credentialsPath
+        });
+    }
+
+    public setCredentials(keyFilePath: string): void {
+        console.log(`[GoogleSTT/${this.label}] Updating credentials to: ${keyFilePath}`);
+        process.env.GOOGLE_APPLICATION_CREDENTIALS = keyFilePath;
+        this.client = new SpeechClient({
+            keyFilename: keyFilePath
+        });
+    }
+
+    public setSampleRate(rate: number): void {
+        if (this.sampleRateHertz === rate) return;
+        console.log(`[GoogleSTT/${this.label}] Updating Sample Rate to: ${rate}Hz`);
+        this.sampleRateHertz = rate;
+        if (this.isStreaming || this.isActive) {
+            console.warn(`[GoogleSTT/${this.label}] Config changed while active. Restarting stream...`);
+            this.stop();
+            this.start();
+        }
+    }
+
+    /**
+     * No-op for GoogleSTT — Google handles VAD server-side.
+     * This method exists for interface consistency with RestSTT so that
+     * main.ts can call notifySpeechEnded() without type-casting to `any`.
+     */
+    public notifySpeechEnded(): void {
+        // Intentionally empty. Google STT detects speech boundaries server-side.
+    }
+
+    public setAudioChannelCount(count: number): void {
+        if (this.audioChannelCount === count) return;
+        console.log(`[GoogleSTT/${this.label}] Updating Channel Count to: ${count}`);
+        this.audioChannelCount = count;
+        if (this.isStreaming || this.isActive) {
+            console.warn(`[GoogleSTT/${this.label}] Config changed while active. Restarting stream...`);
+            this.stop();
+            this.start();
+        }
+    }
+
+    private pendingLanguageChange?: NodeJS.Timeout;
+
+    public setRecognitionLanguage(key: string): void {
+        // Debounce to prevent rapid restarts (e.g. scrolling through list)
+        if (this.pendingLanguageChange) {
+            clearTimeout(this.pendingLanguageChange);
+        }
+
+        this.pendingLanguageChange = setTimeout(() => {
+            if (key === 'auto') {
+                // Google STT v1 supports up to 3 alternativeLanguageCodes.
+                // Use en-US as primary with the most common languages as alternates.
+                this.languageCode = 'en-US';
+                this.alternativeLanguageCodes = ['fr-FR', 'es-ES', 'de-DE'];
+                console.log(`[GoogleSTT/${this.label}] Language set to auto-detect (en-US + fr/es/de alternates)`);
+            } else {
+                const config = RECOGNITION_LANGUAGES[key];
+                if (!config) {
+                    console.warn(`[GoogleSTT/${this.label}] Unknown language key: ${key}`);
+                    return;
+                }
+
+                this.languageCode = GoogleSTT.V1_LANGUAGE_CODE_OVERRIDES[config.bcp47] ?? config.bcp47;
+                console.log(`[GoogleSTT/${this.label}] Updating recognition language to: ${key} (${this.languageCode})`);
+
+                if ('alternates' in config) {
+                    this.alternativeLanguageCodes = (config as EnglishVariant).alternates;
+                } else {
+                    this.alternativeLanguageCodes = [];
+                }
+
+                console.log(`[GoogleSTT/${this.label}] Primary:`, this.languageCode);
+                if (this.alternativeLanguageCodes.length > 0) {
+                    console.log(`[GoogleSTT/${this.label}] Alternates:`, this.alternativeLanguageCodes.join(', '));
+                }
+            }
+
+            // A downgrade is a fact about the OLD language+model pair, so the new
+            // language gets its own latest_long attempt. (start() resets this too,
+            // but only the active path reaches start().)
+            this.modelDowngraded = false;
+
+            // Restart if active
+            if (this.isStreaming || this.isActive) {
+                console.log(`[GoogleSTT/${this.label}] Language changed while active. Restarting stream...`);
+                this.stop();
+                this.start();
+            }
+
+            this.pendingLanguageChange = undefined;
+        }, 250);
+    }
+
+    public start(): void {
+        if (this.isActive) return;
+        this.isActive = true;
+        this.isFatalError = false;
+        this.modelDowngraded = false;
+        this.writeCount = 0;
+
+        this.openDumpStream();
+
+        console.log(`[GoogleSTT/${this.label}] Starting recognition stream (rate=${this.sampleRateHertz}Hz, ch=${this.audioChannelCount})...`);
+        this.startStream();
+    }
+
+    /** Opt-in diagnostic: open a raw-PCM dump of the exact bytes sent to Google. */
+    private openDumpStream(): void {
+        if (process.env.NATIVELY_STT_DUMP !== '1' || this.dumpStream) return;
+        try {
+            const file = path.join(os.homedir(), `google_stt_${this.label}_${this.sampleRateHertz}hz.raw`);
+            this.dumpStream = fs.createWriteStream(file);
+            this.dumpBytes = 0;
+            console.log(`[GoogleSTT/${this.label}] 🎙️  PCM dump OPEN → ${file} (play: ffmpeg -f s16le -ar ${this.sampleRateHertz} -ac ${this.audioChannelCount} -i "${file}" out.wav)`);
+        } catch (e) {
+            console.error(`[GoogleSTT/${this.label}] Failed to open PCM dump:`, e);
+        }
+    }
+
+    private closeDumpStream(): void {
+        if (!this.dumpStream) return;
+        try { this.dumpStream.end(); } catch { /* ignore */ }
+        console.log(`[GoogleSTT/${this.label}] 🎙️  PCM dump CLOSED (${this.dumpBytes} bytes ≈ ${(this.dumpBytes / 2 / Math.max(1, this.sampleRateHertz)).toFixed(1)}s @ ${this.sampleRateHertz}Hz)`);
+        this.dumpStream = null;
+    }
+
+    public stop(): void {
+        if (!this.isActive) return;
+
+        console.log(`[GoogleSTT/${this.label}] Stopping stream (wrote ${this.writeCount} chunks total)...`);
+        this.isActive = false;
+        this.isStreaming = false;
+
+        if (this.proactiveRestartTimer) {
+            clearTimeout(this.proactiveRestartTimer);
+            this.proactiveRestartTimer = null;
+        }
+
+        // Clear any in-flight 250ms language-change debounce. Without this,
+        // a user who changes language right before clicking Stop would have
+        // the debounce body fire ~250ms after endMeeting() — the body would
+        // see isStreaming=false and isActive=false (so it skips the
+        // stop()+start() restart), BUT the timer's libuv slot survives, and
+        // more importantly the closed-over `key` lock could leak the
+        // language alternates into a NEXT session if start() runs before the
+        // timer fires. Cancelling here keeps the next meeting's language
+        // state clean.
+        if (this.pendingLanguageChange) {
+            clearTimeout(this.pendingLanguageChange);
+            this.pendingLanguageChange = undefined;
+        }
+
+        if (this.stream) {
+            this.stream.end();
+            this.stream.destroy();
+            this.stream = null;
+        }
+
+        this.closeDumpStream();
+    }
+
+    public finalize(): void {
+        if (!this.isActive || !this.stream) return;
+        console.log(`[GoogleSTT/${this.label}] Finalize — ending gRPC stream to flush final transcript`);
+        try {
+            this.stream.end();
+        } catch (err) {
+            console.error(`[GoogleSTT/${this.label}] Finalize end() failed:`, err);
+        }
+        this.isStreaming = false;
+        this.stream = null;
+    }
+
+    private buffer: Buffer[] = [];
+    private isConnecting = false;
+    private lastConnectAttempt = 0;
+
+    // Google's streamingRecognize hard-kills any stream after 305 seconds.
+    // We proactively restart at 4:30 (270s) to prevent the forced close from
+    // causing a 1-second gap in transcription during long interviews.
+    private proactiveRestartTimer: NodeJS.Timeout | null = null;
+    private static readonly PROACTIVE_RESTART_MS = 270_000; // 4 min 30 sec
+
+    /**
+     * True only if every byte of the chunk is zero (a Rust-DSP keepalive frame).
+     * Scans the whole buffer — never strided — so a chunk containing even one
+     * non-zero sample of real audio is never misclassified as silence and dropped.
+     * Chunks are ≤5760 bytes and arrive every 20–60ms, so a full scan is cheap.
+     */
+    private isAllZeroChunk(buf: Buffer): boolean {
+        if (buf.length === 0) return true;
+        for (let i = 0; i < buf.length; i++) {
+            if (buf[i] !== 0) return false;
+        }
+        return true;
+    }
+
+    public write(audioData: Buffer): void {
+        if (!this.isActive || this.isFatalError) {
+            // Only log occasionally to avoid spam
+            if (this.writeCount === 0) console.warn(`[GoogleSTT/${this.label}] write() called but isActive=false — data dropped`);
+            return;
+        }
+
+        // Drop pure zero-fill keepalive frames injected by the Rust DSP
+        // (FrameAction::SendSilence → vec![0u8; chunk_size*2]). For system audio
+        // the suppressor runs with VAD disabled and a permissive RMS floor, so it
+        // oscillates between real low-amplitude Send frames and these silent
+        // keepalives. Google's streamingRecognize (unlike Deepgram/Natively, which
+        // endpoint cleanly on silence) hallucinates tiny interim fragments —
+        // "he", "heh", "hehehe" — when real audio is interleaved with zero frames.
+        // Google holds the gRPC stream open on its own (10s idle timeout) and
+        // write() lazily reconnects on the next real chunk, so the keepalive serves
+        // no purpose here and only corrupts recognition. Real audio is never
+        // bit-exactly zero (noise floor/dither), so an all-zero chunk is
+        // unambiguously a keepalive.
+        if (this.isAllZeroChunk(audioData)) return;
+
+        // Diagnostic: capture the exact non-keepalive bytes handed to Google.
+        if (this.dumpStream) {
+            try { this.dumpStream.write(audioData); this.dumpBytes += audioData.length; } catch { /* ignore */ }
+        }
+
+        this.writeCount++;
+
+        if (!this.isStreaming || !this.stream) {
+            // Buffer if we are in connecting state, just started, or closed
+            this.buffer.push(audioData);
+            if (this.buffer.length > 500) this.buffer.shift(); // Cap buffer size
+
+            if (!this.isConnecting) {
+                if (Date.now() - this.lastConnectAttempt > 1000) {
+                    console.log(`[GoogleSTT/${this.label}] Stream not ready (write #${this.writeCount}). Lazy connecting on new audio...`);
+                    this.startStream();
+                }
+            }
+            return;
+        }
+
+        // Safety check to prevent "write after destroyed" error
+        if (this.stream.destroyed) {
+            this.isStreaming = false;
+            this.stream = null;
+            this.buffer.push(audioData);
+            if (this.buffer.length > 500) this.buffer.shift(); // Cap buffer size
+
+            if (!this.isConnecting) {
+                if (Date.now() - this.lastConnectAttempt > 1000) {
+                    console.log(`[GoogleSTT/${this.label}] Stream destroyed (write #${this.writeCount}). Lazy reconnecting...`);
+                    this.startStream();
+                }
+            }
+            return;
+        }
+
+        try {
+            // Log first 5 writes always, then every ~50th
+            if (this.writeCount <= 5 || Math.random() < 0.02) {
+                console.log(`[GoogleSTT/${this.label}] Writing ${audioData.length} bytes to stream (write #${this.writeCount}, isStreaming=${this.isStreaming})`);
+            }
+
+            if (this.stream.writable) {
+                this.stream.write(audioData);
+            } else {
+                console.warn(`[GoogleSTT/${this.label}] Stream not writable! (write #${this.writeCount})`);
+            }
+        } catch (err) {
+            console.error(`[GoogleSTT/${this.label}] Safe write failed:`, err);
+            this.isStreaming = false;
+        }
+    }
+
+    private flushBuffer(): void {
+        if (!this.stream) return;
+
+        while (this.buffer.length > 0) {
+            if (!this.stream.writable) {
+                console.warn(`[GoogleSTT/${this.label}] flushBuffer: stream not writable — ${this.buffer.length} chunks re-queued`);
+                break; // Leave remaining chunks in buffer for next stream
+            }
+            const data = this.buffer.shift();
+            if (data) {
+                try {
+                    this.stream.write(data);
+                } catch (e) {
+                    console.error(`[GoogleSTT/${this.label}] Failed to flush buffer chunk:`, e);
+                    break;
+                }
+            }
+        }
+    }
+
+    /**
+     * `latest_long` is the quality default, but STT v1 offers it for only a
+     * subset of locales — Mandarin, for one, supports `default` and
+     * `command_and_search` only. An unsupported model+language pair is rejected
+     * with INVALID_ARGUMENT, a PERMANENT_GRPC_CODES entry, which used to kill
+     * STT for the entire session ("Chinese never transcribes", PR #494).
+     *
+     * LANGUAGES_WITHOUT_LATEST_LONG catches the pairs we know about up front;
+     * `modelDowngraded` catches the ones we do not, after Google has told us
+     * once. Google no longer publishes the v1 language x model table (both doc
+     * URLs now redirect to v2, which uses chirp/long/short), so the static list
+     * can never be proven complete — the runtime downgrade is what actually
+     * closes the class.
+     */
+    private resolveModel(): 'default' | 'latest_long' {
+        if (this.modelDowngraded) return 'default';
+        return GoogleSTT.LANGUAGES_WITHOUT_LATEST_LONG.has(this.languageCode)
+            ? 'default'
+            : 'latest_long';
+    }
+
+    private startStream(): void {
+        this.lastConnectAttempt = Date.now();
+        this.isStreaming = true;
+        this.isConnecting = true;
+
+        console.log(`[GoogleSTT/${this.label}] Creating gRPC stream (rate=${this.sampleRateHertz}Hz, ch=${this.audioChannelCount}, lang=${this.languageCode})...`);
+
+        // F-203: bind the instance to a local so every STATE-MUTATING handler
+        // can verify it still owns `this.stream` before touching shared state.
+        // Without this, the synchronous stop()+start() restarts (setSampleRate
+        // — which main.ts triggers on the first audio chunk of every meeting —
+        // setAudioChannelCount, setRecognitionLanguage, and the 270s proactive
+        // restart) let the DESTROYED stream's async 'close'/'end' run
+        // `this.stream = null` against the freshly-created stream, orphaning it
+        // (open, never ended) and pushing writes into the lazy-reconnect path
+        // so a third stream opens. Mirrors NativelyProSTT's documented
+        // `guard(ws === this.ws)` pattern. Live-reproduced in
+        // scripts/audit/F-203-repro.mjs.
+        const stream: any = this.client
+            .streamingRecognize({
+                config: {
+                    encoding: this.encoding,
+                    sampleRateHertz: this.sampleRateHertz,
+                    audioChannelCount: this.audioChannelCount,
+                    languageCode: this.languageCode,
+                    enableAutomaticPunctuation: true,
+                    model: this.resolveModel(),
+                    useEnhanced: true,
+                    alternativeLanguageCodes: this.alternativeLanguageCodes,
+                },
+                interimResults: true,
+            })
+            .on('error', (err: Error) => {
+                if (stream !== this.stream) return; // F-203 stale-stream guard
+                this.isConnecting = false;
+                this.isStreaming = false;
+                this.stream = null;
+
+                const grpcCode = (err as any)?.code;
+
+                // Google's streamingRecognize closes the stream with code 11
+                // ("Audio Timeout Error: Long duration elapsed without audio")
+                // after ~10s of silence. The lazy-reconnect path in write()
+                // recovers automatically on the next chunk, so this is benign
+                // and recurs every silent stretch. Log a single warn line and
+                // do NOT re-emit as an error — bubbling it up trips the
+                // consecutive-error counter in main.ts and spams the renderer
+                // with reconnecting/failed STT status updates during normal
+                // silence.
+                const isIdleTimeout = grpcCode === 11
+                    || /Audio Timeout Error/i.test(err.message || '');
+                if (isIdleTimeout) {
+                    console.warn(`[GoogleSTT/${this.label}] Stream idle-timed-out (Google's 10s no-audio limit), reconnecting on next chunk.`);
+                    return;
+                }
+
+                // INVALID_ARGUMENT on a `latest_long` stream is far more likely the
+                // model than the credentials: v1 supports latest_long for only some
+                // locales and rejects the pair outright. Answer the FIRST one by
+                // dropping to `default` and letting write()'s lazy reconnect reopen
+                // the stream, rather than disabling STT for the session. Not
+                // re-emitted, for the same reason the idle timeout is not: main.ts's
+                // consecutive-error counter would tear the session down anyway. A
+                // second code 3 — or one that arrives while we are already on
+                // `default` — falls through below and is treated as permanent.
+                if (grpcCode === 3 && !this.modelDowngraded && this.resolveModel() === 'latest_long') {
+                    this.modelDowngraded = true;
+                    console.warn(
+                        `[GoogleSTT/${this.label}] INVALID_ARGUMENT on model=latest_long ` +
+                        `(lang=${this.languageCode}) — retrying once on model=default. ` +
+                        `Add '${this.languageCode}' to LANGUAGES_WITHOUT_LATEST_LONG to skip this ` +
+                        `round-trip. Google said: ${err.message}`
+                    );
+                    return;
+                }
+
+                console.error(`[GoogleSTT/${this.label}] Stream error:`, err);
+
+                if (typeof grpcCode === 'number' && GoogleSTT.PERMANENT_GRPC_CODES.has(grpcCode)) {
+                    // Permanent failure — stop the write()-driven reconnect loop. Without this
+                    // guard, a misconfigured Google project (e.g. Speech API not enabled →
+                    // PERMISSION_DENIED) loops forever at ~1 reconnect/sec for the whole
+                    // session. See issue #171.
+                    console.error(
+                        `[GoogleSTT/${this.label}] Permanent gRPC error (code ${grpcCode}) — ` +
+                        `disabling STT for this session. No further retries.`
+                    );
+                    this.isFatalError = true;
+                    if (this.proactiveRestartTimer) {
+                        clearTimeout(this.proactiveRestartTimer);
+                        this.proactiveRestartTimer = null;
+                    }
+                }
+
+                this.emit('error', err);
+            })
+            .on('end', () => {
+                if (stream !== this.stream) return; // F-203 stale-stream guard
+                console.log(`[GoogleSTT/${this.label}] Stream ended server-side (idle timeout)`);
+                this.isConnecting = false;
+                this.isStreaming = false;
+                this.stream = null;
+            })
+            .on('close', () => {
+                if (stream !== this.stream) return; // F-203 stale-stream guard
+                console.log(`[GoogleSTT/${this.label}] Stream closed server-side`);
+                this.isConnecting = false;
+                this.isStreaming = false;
+                this.stream = null;
+            })
+            .on('data', (data: any) => {
+                if (data.results[0] && data.results[0].alternatives[0]) {
+                    const result = data.results[0];
+                    const alt = result.alternatives[0];
+                    const transcript = alt.transcript;
+                    const isFinal = result.isFinal;
+
+                    if (transcript) {
+                        console.log(`[GoogleSTT/${this.label}] Transcript received`, { final: isFinal, length: transcript.length });
+                        this.emit('transcript', {
+                            text: transcript,
+                            isFinal,
+                            confidence: alt.confidence
+                        });
+                    }
+                }
+            });
+
+        // Publish the new stream only after its handlers are attached. The
+        // 'data' handler is deliberately NOT identity-guarded: it mutates no
+        // connection state, and a late final transcript is still real user
+        // speech that should reach the transcript.
+        this.stream = stream;
+
+        // gRPC streams are writable immediately — no handshake needed.
+        const bufferedCount = this.buffer.length;
+        this.isConnecting = false;
+        this.flushBuffer();
+
+        console.log(`[GoogleSTT/${this.label}] Stream created. Flushed ${bufferedCount} buffered chunks. Waiting for events...`);
+
+        // Schedule proactive restart before Google's 305-second hard limit.
+        // Without this, the server closes the stream at 305s causing up to 1s of
+        // lost audio until the lazy reconnect in write() fires.
+        if (this.proactiveRestartTimer) clearTimeout(this.proactiveRestartTimer);
+        this.proactiveRestartTimer = setTimeout(() => {
+            this.proactiveRestartTimer = null;
+            if (!this.isActive) return;
+            console.log(`[GoogleSTT/${this.label}] Proactive stream restart at 4:30 to preempt Google's 305s limit`);
+            if (this.stream) {
+                this.stream.end();
+                this.stream.destroy();
+                this.stream = null;
+            }
+            this.isStreaming = false;
+            this.startStream();
+        }, GoogleSTT.PROACTIVE_RESTART_MS);
+    }
+}
